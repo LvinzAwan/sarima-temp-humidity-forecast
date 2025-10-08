@@ -1,0 +1,23 @@
+# Core dependencies - updated for better compatibility
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# Time series analysis
+statsmodels>=0.14.0
+
+# FastAPI and server
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# Database
+supabase>=2.3.0
+
+# Additional utilities
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# Optional: untuk visualisasi (jika dibutuhkan untuk development)
+# matplotlib>=3.8.2
+# seaborn>=0.13.0
