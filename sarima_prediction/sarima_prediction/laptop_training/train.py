@@ -173,7 +173,8 @@ def process_location(lokasi, trainer, optimize=False):
     print(f"PROCESSING: {lokasi.upper()}")
     print(f"{'='*60}")
     
-    csv_file = f"data/{lokasi}.csv"
+    base_path = os.path.dirname(__file__)
+    csv_file = os.path.join(base_path, "data", f"{lokasi}.csv")
     
     try:
         df = pd.read_csv(csv_file)
@@ -240,8 +241,10 @@ def process_location(lokasi, trainer, optimize=False):
         'window_days': trainer.window_days,
         'data_range': (df.index.min(), df.index.max())
     }
+
+    base_path = os.path.dirname(__file__)
+    model_file = os.path.join(base_path, "models", f"{lokasi}_models.pkl")
     
-    model_file = f"models/{lokasi}_models.pkl"
     with open(model_file, 'wb') as f:
         pickle.dump(model_data, f)
     
