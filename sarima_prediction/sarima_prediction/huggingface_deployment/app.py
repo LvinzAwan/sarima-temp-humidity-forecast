@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 from datetime import datetime
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Dict
 import warnings
 import requests
 from huggingface_hub import hf_hub_download
@@ -14,8 +14,8 @@ warnings.filterwarnings('ignore')
 
 app = FastAPI(
     title="Prediksi Suhu & Kelembapan API",
-    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA",
-    version="1.0.0"
+    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA dengan risk scoring",
+    version="2.0.0"
 )
 
 ALLOWED_ORIGINS = [
@@ -48,11 +48,22 @@ class PredictionItem(BaseModel):
     suhu: float
     kelembapan: float
 
+class RiskScoreDetail(BaseModel):
+    skor_dasar: float
+    skor_trend: float
+    skor_stabilitas: float
+
+class RiskScore(BaseModel):
+    persentase: float
+    kategori: str
+    detail: RiskScoreDetail
+
 class PredictionResponse(BaseModel):
     lokasi: str
     data_points_used: int
     strategy_used: str
     anomaly_detected: bool
+    skoring: RiskScore
     note: Optional[str] = None
     prediksi: List[PredictionItem]
 
@@ -97,7 +108,6 @@ def load_models():
                 print(f"Loaded data structure for {lokasi}: {type(loaded_data)}")
                 print(f"Keys in loaded data: {list(loaded_data.keys()) if isinstance(loaded_data, dict) else 'Not a dict'}")
                 
-                # Check if the structure has all required components
                 if isinstance(loaded_data, dict) and 'models' in loaded_data and 'scalers' in loaded_data:
                     actual_models = loaded_data['models']
                     scalers = loaded_data['scalers']
@@ -106,7 +116,6 @@ def load_models():
                     print(f"Keys in models: {list(actual_models.keys()) if isinstance(actual_models, dict) else 'Not a dict'}")
                     print(f"Scalers available: {list(scalers.keys()) if isinstance(scalers, dict) else 'Not a dict'}")
                     
-                    # Check if suhu and kelembapan models exist
                     if (isinstance(actual_models, dict) and 'suhu' in actual_models and 'kelembapan' in actual_models and
                         isinstance(scalers, dict) and 'suhu' in scalers and 'kelembapan' in scalers):
                         
@@ -119,27 +128,27 @@ def load_models():
                         print(f"✓ Model {lokasi} loaded successfully with scalers")
                         model_stats[lokasi] = get_default_model_stats(lokasi)
                     else:
-                        print(f"✗ Model {lokasi} missing required components")
+                        print(f"  Model {lokasi} missing required components")
                         print(f"  Models keys: {list(actual_models.keys()) if isinstance(actual_models, dict) else 'None'}")
                         print(f"  Scalers keys: {list(scalers.keys()) if isinstance(scalers, dict) else 'None'}")
                 
                 else:
-                    print(f"✗ Model {lokasi} format not recognized. Missing 'models' or 'scalers' key")
+                    print(f" Model {lokasi} format not recognized. Missing 'models' or 'scalers' key")
                     if isinstance(loaded_data, dict):
                         print(f"Available keys: {list(loaded_data.keys())}")
                     
             except Exception as e:
-                print(f"✗ Error loading model {lokasi}: {str(e)}")
+                print(f" Error loading model {lokasi}: {str(e)}")
                 import traceback
                 traceback.print_exc()
         else:
-            print(f"✗ Model {lokasi} file not available")
+            print(f" Model {lokasi} file not available")
 
 def get_default_model_stats(lokasi: str) -> dict:
     stats_mapping = {
         'kulkas': {
             'suhu': {'mean': 4.0, 'std': 1.0, 'min': 1.0, 'max': 8.0},
-            'kelembapan': {'mean': 85.0, 'std': 5.0, 'min': 75.0, 'max': 95.0}
+            'kelembapan': {'mean': 80.0, 'std': 7.0, 'min': 60.0, 'max': 95.0}
         }
     }
     return stats_mapping.get(lokasi, {
@@ -147,12 +156,85 @@ def get_default_model_stats(lokasi: str) -> dict:
         'kelembapan': {'mean': 60.0, 'std': 10.0, 'min': 40.0, 'max': 80.0}
     })
 
+def calculate_risk_score(data: pd.DataFrame) -> dict:
+    
+    suhu_data = data['suhu']
+    kelembapan_data = data['kelembapan']
+    
+    # Nilai terakhir
+    suhu_terakhir = suhu_data.iloc[-1]
+    kelembapan_terakhir = kelembapan_data.iloc[-1]
+    
+    # Skor Dasar (Deviation Score)
+    ideal_suhu = 4.0
+    ideal_kelembapan = 80.0
+    
+    deviasi_suhu = abs(suhu_terakhir - ideal_suhu)
+    deviasi_kelembapan = abs(kelembapan_terakhir - ideal_kelembapan)
+    
+    skor_suhu = max(0, 100 - (deviasi_suhu / 4.0) * 100)
+    skor_kelembapan = max(0, 100 - (deviasi_kelembapan / 20.0) * 100)
+    
+    skor_dasar = (0.6 * skor_suhu) + (0.4 * skor_kelembapan)
+    
+    #  Skor Trend (Trend-Based Scoring)
+    trend_suhu = suhu_data.iloc[-1] - suhu_data.iloc[0]
+    trend_kelembapan = kelembapan_data.iloc[-1] - kelembapan_data.iloc[0]
+    
+    penalti_trend = 0
+    
+    # Penalti untuk trend suhu
+    if trend_suhu > 1.0:
+        penalti_trend += 10
+    elif trend_suhu < -1.0:
+        penalti_trend -= 5
+    
+    # Penalti untuk trend kelembapan
+    if trend_kelembapan < -10:
+        penalti_trend += 10
+    elif trend_kelembapan > 0 and kelembapan_terakhir <= 90:
+        penalti_trend -= 5
+    
+    skor_trend = max(0, min(100, 100 - penalti_trend))
+    
+    # Skor Stabilitas (Volatility Score)
+    std_suhu = np.std(suhu_data)
+    std_kelembapan = np.std(kelembapan_data)
+    
+    stabilitas_suhu = max(0, 100 - (std_suhu / 2.0) * 100)
+    stabilitas_kelembapan = max(0, 100 - (std_kelembapan / 5.0) * 100)
+    
+    skor_stabilitas = (stabilitas_suhu + stabilitas_kelembapan) / 2
+    
+    #  Skor Akhir
+    skor_akhir = (0.6 * skor_dasar) + (0.25 * skor_trend) + (0.15 * skor_stabilitas)
+    
+    # Kategori Risiko
+    if skor_akhir >= 90:
+        kategori = "Sangat Aman"
+    elif skor_akhir >= 75:
+        kategori = "Aman"
+    elif skor_akhir >= 60:
+        kategori = "Waspada"
+    elif skor_akhir >= 40:
+        kategori = "Berisiko"
+    else:
+        kategori = "Bahaya"
+    
+    return {
+        "persentase": round(skor_akhir, 2),
+        "kategori": kategori,
+        "detail": {
+            "skor_dasar": round(skor_dasar, 2),
+            "skor_trend": round(skor_trend, 2),
+            "skor_stabilitas": round(skor_stabilitas, 2)
+        }
+    }
+
 def scale_data(data, column, scaler):
-    """Scale data using the provided scaler"""
     return scaler.transform(data[[column]]).flatten()
 
 def inverse_scale_data(values, column, scaler):
-    """Inverse scale data using the provided scaler"""
     if isinstance(values, pd.Series):
         values = values.values
     return scaler.inverse_transform(values.reshape(-1, 1)).flatten()
@@ -171,7 +253,6 @@ def detect_anomaly_and_choose_strategy(data: pd.DataFrame, lokasi: str) -> tuple
     
     anomaly_reasons = []
     
-    # Make anomaly detection less sensitive by using 3.0 instead of 2.5 standard deviations
     suhu_lower = suhu_stats.get('mean', 25) - (3.0 * suhu_stats.get('std', 3))
     suhu_upper = suhu_stats.get('mean', 25) + (3.0 * suhu_stats.get('std', 3))
     
@@ -193,18 +274,16 @@ def detect_anomaly_and_choose_strategy(data: pd.DataFrame, lokasi: str) -> tuple
         max_suhu_change = suhu_changes.max()
         max_kelembapan_change = kelembapan_changes.max()
         
-        # Increased thresholds to be less sensitive
-        if max_suhu_change > 7.0:  # was 5.0
+        if max_suhu_change > 7.0:
             anomaly_reasons.append(f"Perubahan suhu drastis: {max_suhu_change:.1f}°C/jam")
         
-        if max_kelembapan_change > 15.0:  # was 12.0
+        if max_kelembapan_change > 15.0:
             anomaly_reasons.append(f"Perubahan kelembapan drastis: {max_kelembapan_change:.1f}%/jam")
     
     if len(data) >= 3:
         suhu_trend = calculate_trend_strength(data['suhu'].values)
         kelembapan_trend = calculate_trend_strength(data['kelembapan'].values)
         
-        # Significantly increased threshold from 0.9 to 0.97 to be much less sensitive
         if abs(suhu_trend) > 0.97:
             anomaly_reasons.append(f"Trend suhu sangat kuat")
         
@@ -213,7 +292,6 @@ def detect_anomaly_and_choose_strategy(data: pd.DataFrame, lokasi: str) -> tuple
     
     is_anomaly = len(anomaly_reasons) > 0
     
-    # Force hybrid as default unless there's a clear anomaly
     if is_anomaly:
         strategy = "trend_based"
         explanation = f"Prediksi berbasis trend: {'; '.join(anomaly_reasons)}"
@@ -289,14 +367,12 @@ def process_input_data(sensor_data: List[SensorDataPoint]) -> tuple[pd.DataFrame
 def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> tuple[List[dict], str, bool, str]:
     strategy, is_anomaly, explanation = detect_anomaly_and_choose_strategy(data, lokasi)
     
-    # Check if location exists in models_cache
     if lokasi not in models_cache:
         raise HTTPException(
             status_code=404,
             detail=f"Model untuk lokasi '{lokasi}' tidak tersedia"
         )
     
-    # Get models and scalers
     model_data = models_cache[lokasi]
     models = model_data['models']
     scalers = model_data['scalers']
@@ -320,12 +396,10 @@ def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> 
         )
     
     if strategy == "hybrid":
-        # Validate models are callable
         try:
             suhu_model = models['suhu']
             kelembapan_model = models['kelembapan']
             
-            # Check if models have forecast method
             if not hasattr(suhu_model, 'forecast'):
                 strategy = "trend_based"
                 explanation += " | Model suhu tidak memiliki method forecast"
@@ -360,7 +434,6 @@ def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> 
                 )
             except Exception as model_error:
                 print(f"Model prediction failed: {str(model_error)}")
-                # Fallback to trend-based prediction
                 predictions = predict_pure_trend(suhu_data, kelembapan_data, steps)
                 strategy = "trend_based"
                 explanation = f"Fallback to trend-based due to model error: {str(model_error)}"
@@ -377,36 +450,27 @@ def predict_with_trend_adaptation_scaled(suhu_data: pd.Series, kelembapan_data: 
                                        suhu_model, kelembapan_model,
                                        suhu_scaler, kelembapan_scaler,
                                        steps: int, trend_weight: float = 0.3) -> List[dict]:
-    """
-    Enhanced prediction function that handles data scaling properly
-    """
     suhu_trend = calculate_advanced_trend(suhu_data.values)
     kelembapan_trend = calculate_advanced_trend(kelembapan_data.values)
     
     last_suhu = suhu_data.iloc[-1]
     last_kelembapan = kelembapan_data.iloc[-1]
     
-    # Scale the input data for model prediction
     try:
-        # Create DataFrame for scaling
         temp_df_suhu = pd.DataFrame({'suhu': suhu_data})
         temp_df_kelembapan = pd.DataFrame({'kelembapan': kelembapan_data})
         
-        # Scale the data
         suhu_scaled = scale_data(temp_df_suhu, 'suhu', suhu_scaler)
         kelembapan_scaled = scale_data(temp_df_kelembapan, 'kelembapan', kelembapan_scaler)
         
-        # Get model forecasts on scaled data
         model_suhu_forecast_scaled = suhu_model.forecast(steps=steps)
         model_kelembapan_forecast_scaled = kelembapan_model.forecast(steps=steps)
         
-        # Convert to Series if needed
         if not isinstance(model_suhu_forecast_scaled, pd.Series):
             model_suhu_forecast_scaled = pd.Series(model_suhu_forecast_scaled)
         if not isinstance(model_kelembapan_forecast_scaled, pd.Series):
             model_kelembapan_forecast_scaled = pd.Series(model_kelembapan_forecast_scaled)
         
-        # Inverse scale the forecasts to original units
         model_suhu_forecast = inverse_scale_data(model_suhu_forecast_scaled, 'suhu', suhu_scaler)
         model_kelembapan_forecast = inverse_scale_data(model_kelembapan_forecast_scaled, 'kelembapan', kelembapan_scaler)
         
@@ -417,7 +481,6 @@ def predict_with_trend_adaptation_scaled(suhu_data: pd.Series, kelembapan_data: 
     predictions = []
     
     for i in range(steps):
-        # Slower decay of trend weight to maintain model dominance
         current_trend_weight = trend_weight * (0.95 ** i)
         current_model_weight = 1 - current_trend_weight
         
@@ -429,7 +492,6 @@ def predict_with_trend_adaptation_scaled(suhu_data: pd.Series, kelembapan_data: 
             final_kelembapan = (trend_kelembapan * current_trend_weight) + (float(model_kelembapan_forecast[i]) * current_model_weight)
         except Exception as e:
             print(f"Error combining predictions at step {i}: {e}")
-            # Fallback to trend only for this step
             final_suhu = trend_suhu
             final_kelembapan = trend_kelembapan
         
@@ -556,11 +618,12 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {
-        "message": "Prediksi Suhu & Kelembapan API v2.0",
-        "description": "API untuk prediksi dengan input data manual",
+        "message": "Prediksi Suhu & Kelembapan API with Risk Scoring",
+        "description": "API untuk prediksi dengan input data manual dan skoring risiko",
         "status": "running",
-        "available_locations": [ "kulkas"],
+        "available_locations": ["kulkas"],
         "models_loaded": list(models_cache.keys()),
+        "features": ["prediction", "risk_scoring", "anomaly_detection"],
         "docs": "/docs"
     }
 
@@ -592,9 +655,16 @@ async def predict(request: PredictionRequest):
         )
     
     try:
+        # Process input data
         processed_data, note = process_input_data(request.data_sensor)
+        
+        # Calculate risk score
+        risk_score = calculate_risk_score(processed_data)
+        
+        # Make predictions
         predictions, strategy, is_anomaly, explanation = predict_with_input_data(lokasi, processed_data, steps)
         
+        # Combine notes
         final_note = note
         if final_note and explanation:
             final_note += f" | {explanation}"
@@ -606,6 +676,11 @@ async def predict(request: PredictionRequest):
             data_points_used=len(processed_data),
             strategy_used=strategy,
             anomaly_detected=is_anomaly,
+            skoring=RiskScore(
+                persentase=risk_score["persentase"],
+                kategori=risk_score["kategori"],
+                detail=RiskScoreDetail(**risk_score["detail"])
+            ),
             note=final_note,
             prediksi=[PredictionItem(**pred) for pred in predictions]
         )
@@ -655,24 +730,55 @@ async def get_available_models():
 async def get_request_example():
     return {
         "example_request": {
-            "lokasi": "pantry",
+            "lokasi": "kulkas",
             "steps": 3,
             "data_sensor": [
                 {
-                    "timestamp": "2025-09-20T10:00:00",
-                    "suhu": 25.5,
-                    "kelembapan": 65.2
+                    "timestamp": "2025-10-22T10:00:00",
+                    "suhu": 4.2,
+                    "kelembapan": 79.5
                 },
                 {
-                    "timestamp": "2025-09-20T11:00:00",
-                    "suhu": 26.1,
-                    "kelembapan": 64.8
+                    "timestamp": "2025-10-22T11:00:00",
+                    "suhu": 4.3,
+                    "kelembapan": 80.1
                 },
                 {
-                    "timestamp": "2025-09-20T12:00:00",
-                    "suhu": 26.8,
-                    "kelembapan": 63.5
+                    "timestamp": "2025-10-22T12:00:00",
+                    "suhu": 4.1,
+                    "kelembapan": 80.3
+                },
+                {
+                    "timestamp": "2025-10-22T13:00:00",
+                    "suhu": 4.0,
+                    "kelembapan": 79.8
+                },
+                {
+                    "timestamp": "2025-10-22T14:00:00",
+                    "suhu": 4.2,
+                    "kelembapan": 80.0
                 }
+            ]
+        },
+        "example_response": {
+            "lokasi": "kulkas",
+            "data_points_used": 5,
+            "strategy_used": "hybrid",
+            "anomaly_detected": False,
+            "skoring": {
+                "persentase": 88.5,
+                "kategori": "Aman",
+                "detail": {
+                    "skor_dasar": 92.0,
+                    "skor_trend": 85.0,
+                    "skor_stabilitas": 80.0
+                }
+            },
+            "note": "Prediksi hybrid (model + trend) - kondisi normal",
+            "prediksi": [
+                {"jam_ke": 1, "suhu": 4.3, "kelembapan": 79.8},
+                {"jam_ke": 2, "suhu": 4.5, "kelembapan": 80.2},
+                {"jam_ke": 3, "suhu": 4.6, "kelembapan": 81.0}
             ]
         },
         "notes": [
@@ -680,11 +786,81 @@ async def get_request_example():
             "Timestamp format ISO (YYYY-MM-DDTHH:MM:SS)",
             "Data otomatis diurutkan berdasarkan timestamp",
             "Sistem otomatis detect anomali dan pilih strategi",
-            "Model menggunakan scaled data dengan StandardScaler"
-        ]
+            "Model menggunakan scaled data dengan StandardScaler",
+            "Skoring risiko dihitung otomatis berdasarkan kondisi kulkas"
+        ],
+        "risk_scoring_info": {
+            "categories": {
+                "Sangat Aman": "Skor >= 90",
+                "Aman": "Skor 75-89",
+                "Waspada": "Skor 60-74",
+                "Berisiko": "Skor 40-59",
+                "Bahaya": "Skor < 40"
+            },
+            "factors": {
+                "skor_dasar": "60% - Deviasi dari nilai ideal (suhu: 4°C, kelembapan: 80%)",
+                "skor_trend": "25% - Perubahan trend suhu dan kelembapan",
+                "skor_stabilitas": "15% - Volatilitas/fluktuasi data"
+            }
+        }
+    }
+
+@app.get("/risk-info")
+async def get_risk_info():
+    """Endpoint untuk mendapatkan informasi tentang sistem skoring risiko"""
+    return {
+        "description": "Sistem skoring risiko untuk kondisi kulkas",
+        "ideal_conditions": {
+            "suhu": "4°C",
+            "kelembapan": "80%"
+        },
+        "scoring_components": {
+            "skor_dasar": {
+                "weight": "60%",
+                "description": "Mengukur deviasi dari nilai ideal",
+                "calculation": "Berdasarkan jarak nilai terakhir dari kondisi ideal"
+            },
+            "skor_trend": {
+                "weight": "25%",
+                "description": "Mengukur perubahan trend",
+                "penalties": {
+                    "suhu_naik": "Penalti 10 jika suhu naik > 1°C",
+                    "suhu_turun": "Bonus 5 jika suhu turun > 1°C",
+                    "kelembapan_turun": "Penalti 10 jika kelembapan turun > 10%",
+                    "kelembapan_naik_normal": "Bonus 5 jika kelembapan naik dan <= 90%"
+                }
+            },
+            "skor_stabilitas": {
+                "weight": "15%",
+                "description": "Mengukur volatilitas/fluktuasi data",
+                "calculation": "Berdasarkan standar deviasi suhu dan kelembapan"
+            }
+        },
+        "categories": {
+            "Sangat Aman": {
+                "range": "90-100",
+                "description": "Kondisi optimal, tidak ada risiko"
+            },
+            "Aman": {
+                "range": "75-89",
+                "description": "Kondisi baik, risiko minimal"
+            },
+            "Waspada": {
+                "range": "60-74",
+                "description": "Perlu perhatian, ada deviasi kecil"
+            },
+            "Berisiko": {
+                "range": "40-59",
+                "description": "Memerlukan tindakan segera"
+            },
+            "Bahaya": {
+                "range": "0-39",
+                "description": "Kondisi kritis, tindakan mendesak diperlukan"
+            }
+        }
     }
 
 if __name__ == "__main__":
-    import uvicorn, os
-    port = int(os.environ.get("PORT", "7860"))  # Spaces default 7860
+    import uvicorn
+    port = int(os.environ.get("PORT", "7860"))
     uvicorn.run(app, host="0.0.0.0", port=port)
