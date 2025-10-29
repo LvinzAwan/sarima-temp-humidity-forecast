@@ -14,8 +14,7 @@ warnings.filterwarnings('ignore')
 
 app = FastAPI(
     title="Prediksi Suhu & Kelembapan API",
-    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA dengan risk scoring",
-    version="2.0.0"
+    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA dengan risk scoring"
 )
 
 ALLOWED_ORIGINS = [
@@ -33,14 +32,20 @@ app.add_middleware(
     allow_headers=["*"],      
 )
 
-class SensorDataPoint(BaseModel):
-    timestamp: str = Field(..., description="Timestamp format ISO (YYYY-MM-DDTHH:MM:SS)")
-    suhu: float = Field(..., description="Nilai suhu dalam Celsius")
-    kelembapan: float = Field(..., description="Nilai kelembapan dalam persen (%)")
+#Supabase Configuration
+SUPABASE_BASE_URL = os.environ.get(
+    "SUPABASE_BASE_URL", 
+    "https://rcvbwyvnnuurudizkuec.supabase.co/rest/v1/sensor_jam"
+)
+SUPABASE_ANON_KEY = os.environ.get(
+    "SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjdmJ3eXZubnV1cnVkaXprdWVjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgxOTgzNDksImV4cCI6MjA3Mzc3NDM0OX0.YCXPxFi7IQvWKN16soE0-YA_mziN9uN2B1wYkOfuhrc"
+)
 
-class PredictionRequest(BaseModel):
-    lokasi: str = Field(..., description="Lokasi sensor:  kulkas")
-    data_sensor: List[SensorDataPoint] = Field(..., description="Data sensor historis (minimal 3 data point)")
+#Request/Response Models
+class ApiRequest(BaseModel):
+    lokasi: str = Field(..., description="Lokasi sensor: kulkas")
+    device_id: int = Field(..., description="ID device di Supabase")
     steps: Optional[int] = Field(default=3, description="Jumlah jam prediksi (1-12)")
 
 class PredictionItem(BaseModel):
@@ -58,17 +63,128 @@ class RiskScore(BaseModel):
     kategori: str
     detail: RiskScoreDetail
 
+class ScoreResponse(BaseModel):
+    lokasi: str
+    data_points_used: int
+    anomaly_detected: bool
+    strategy_suggested: str
+    skoring: RiskScore
+    note: Optional[str] = None
+
 class PredictionResponse(BaseModel):
     lokasi: str
     data_points_used: int
-    strategy_used: str
-    anomaly_detected: bool
-    skoring: RiskScore
     note: Optional[str] = None
     prediksi: List[PredictionItem]
 
+#Global Variables
 models_cache = {}
 model_stats = {}
+
+#Supabase Helper Functions
+def fetch_data_from_supabase(device_id: int) -> pd.DataFrame:
+    url = f"{SUPABASE_BASE_URL}?select=*&device_id=eq.{device_id}&timestamp=not.is.null&order=timestamp.desc&limit=10"
+    
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Accept": "application/json"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if not data or len(data) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Tidak ada data ditemukan untuk device_id {device_id}"
+            )
+        
+        df = pd.DataFrame(data)
+        
+        df = df.rename(columns={
+            'temp': 'suhu',
+            'humidity': 'kelembapan'
+        })
+        
+        if 'suhu' not in df.columns or 'kelembapan' not in df.columns:
+            raise HTTPException(
+                status_code=500,
+                detail="Data dari Supabase tidak memiliki kolom temp atau humidity"
+            )
+        
+        df = df[['timestamp', 'suhu', 'kelembapan']]
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        if len(df) < 3:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Minimal 3 data point diperlukan, hanya {len(df)} data tersedia di device_id {device_id}"
+            )
+        
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching data from Supabase: {str(e)}"
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error parsing Supabase response: {str(e)}"
+        )
+
+def common_prepare(lokasi: str, device_id: int, steps: int) -> tuple[pd.DataFrame, Optional[str]]:
+    valid_locations = ["kulkas"]
+    if lokasi.lower() not in valid_locations:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Lokasi tidak valid. Pilih: {valid_locations}"
+        )
+    
+    if steps < 1 or steps > 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Steps harus antara 1-12"
+        )
+    
+    df = fetch_data_from_supabase(device_id)
+    
+    note = None
+    data_count = len(df)
+    
+    if data_count < 6:
+        note = f"Data hanya {data_count} point (< 6), akurasi mungkin kurang optimal. Disarankan 10+ data point."
+    elif data_count < 10:
+        note = f"Data hanya {data_count} point (< 10), untuk hasil terbaik gunakan 10+ data point."
+    
+    df['suhu'] = pd.to_numeric(df['suhu'], errors='coerce')
+    df['kelembapan'] = pd.to_numeric(df['kelembapan'], errors='coerce')
+    
+    if df['suhu'].isna().any() or df['kelembapan'].isna().any():
+        df['suhu'] = df['suhu'].interpolate(method='linear')
+        df['kelembapan'] = df['kelembapan'].interpolate(method='linear')
+        
+        if df['suhu'].isna().any() or df['kelembapan'].isna().any():
+            raise HTTPException(
+                status_code=400,
+                detail="Data mengandung nilai yang tidak valid"
+            )
+    
+    if df['suhu'].min() < -50 or df['suhu'].max() > 100:
+        note = (note or "") + " Peringatan: Nilai suhu di luar rentang normal."
+    
+    if df['kelembapan'].min() < 0 or df['kelembapan'].max() > 100:
+        note = (note or "") + " Peringatan: Nilai kelembapan di luar rentang normal."
+    
+    return df, note
 
 
 def download_model_from_hf(lokasi: str):
@@ -156,6 +272,8 @@ def get_default_model_stats(lokasi: str) -> dict:
         'kelembapan': {'mean': 60.0, 'std': 10.0, 'min': 40.0, 'max': 80.0}
     })
 
+#Risk Scoring Functions
+
 def calculate_risk_score(data: pd.DataFrame) -> dict:
     
     suhu_data = data['suhu']
@@ -231,13 +349,7 @@ def calculate_risk_score(data: pd.DataFrame) -> dict:
         }
     }
 
-def scale_data(data, column, scaler):
-    return scaler.transform(data[[column]]).flatten()
-
-def inverse_scale_data(values, column, scaler):
-    if isinstance(values, pd.Series):
-        values = values.values
-    return scaler.inverse_transform(values.reshape(-1, 1)).flatten()
+#Anomaly Detection
 
 def detect_anomaly_and_choose_strategy(data: pd.DataFrame, lokasi: str) -> tuple[str, bool, str]:
     stats = model_stats.get(lokasi, {})
@@ -310,59 +422,15 @@ def calculate_trend_strength(values: np.ndarray) -> float:
     
     return correlation if not np.isnan(correlation) else 0.0
 
-def process_input_data(sensor_data: List[SensorDataPoint]) -> tuple[pd.DataFrame, str]:
-    data_list = []
-    for point in sensor_data:
-        data_list.append({
-            'timestamp': point.timestamp,
-            'suhu': point.suhu,
-            'kelembapan': point.kelembapan
-        })
-    
-    df = pd.DataFrame(data_list)
-    
-    if len(df) < 3:
-        raise HTTPException(
-            status_code=400, 
-            detail="Minimal 3 data point diperlukan"
-        )
-    
-    note = None
-    if len(df) < 6:
-        note = f"Data kurang dari 6 jam ({len(df)} point), akurasi mungkin kurang optimal. Disarankan 12+ data point."
-    elif len(df) < 12:
-        note = f"Data kurang dari 12 jam ({len(df)} point), untuk hasil terbaik gunakan 12+ data point."
-    
-    try:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        df['suhu'] = pd.to_numeric(df['suhu'], errors='coerce')
-        df['kelembapan'] = pd.to_numeric(df['kelembapan'], errors='coerce')
-        
-        if df['suhu'].isna().any() or df['kelembapan'].isna().any():
-            df['suhu'] = df['suhu'].interpolate(method='linear')
-            df['kelembapan'] = df['kelembapan'].interpolate(method='linear')
-            
-            if df['suhu'].isna().any() or df['kelembapan'].isna().any():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Data mengandung nilai yang tidak valid"
-                )
-        
-        if df['suhu'].min() < -50 or df['suhu'].max() > 100:
-            note = (note or "") + " Peringatan: Nilai suhu di luar rentang normal."
-        
-        if df['kelembapan'].min() < 0 or df['kelembapan'].max() > 100:
-            note = (note or "") + " Peringatan: Nilai kelembapan di luar rentang normal."
-        
-        return df, note
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error format timestamp atau data numerik: {str(e)}"
-        )
+#Prediction Functions
+
+def scale_data(data, column, scaler):
+    return scaler.transform(data[[column]]).flatten()
+
+def inverse_scale_data(values, column, scaler):
+    if isinstance(values, pd.Series):
+        values = values.values
+    return scaler.inverse_transform(values.reshape(-1, 1)).flatten()
 
 def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> tuple[List[dict], str, bool, str]:
     strategy, is_anomaly, explanation = detect_anomaly_and_choose_strategy(data, lokasi)
@@ -609,6 +677,8 @@ def apply_constraints(value: float, param_type: str, last_value: float) -> float
     
     return value
 
+#API Endpoints
+
 @app.on_event("startup")
 async def startup_event():
     print("Loading SARIMA models...")
@@ -619,11 +689,15 @@ async def startup_event():
 async def root():
     return {
         "message": "Prediksi Suhu & Kelembapan API with Risk Scoring",
-        "description": "API untuk prediksi dengan input data manual dan skoring risiko",
+        "description": "API untuk prediksi dengan data dari Supabase dan skoring risiko",
         "status": "running",
         "available_locations": ["kulkas"],
         "models_loaded": list(models_cache.keys()),
-        "features": ["prediction", "risk_scoring", "anomaly_detection"],
+        "features": ["prediction", "risk_scoring", "anomaly_detection", "supabase_integration"],
+        "endpoints": {
+            "/score": "Risk scoring only (no predictions)",
+            "/predict": "Full predictions with risk scoring"
+        },
         "docs": "/docs"
     }
 
@@ -631,32 +705,58 @@ async def root():
 async def health_check():
     return {
         "status": "healthy",
-        "version": "2.0.0",
         "models_loaded": len(models_cache),
-        "available_models": list(models_cache.keys())
+        "available_models": list(models_cache.keys()),
+        "supabase_configured": bool(SUPABASE_ANON_KEY and SUPABASE_BASE_URL)
     }
 
+@app.post("/score", response_model=ScoreResponse)
+async def score_endpoint(request: ApiRequest):
+    lokasi = request.lokasi.lower()
+    
+    try:
+        # Prepare data from Supabase
+        processed_data, note = common_prepare(lokasi, request.device_id, request.steps)
+        
+        # Calculate risk score
+        risk_score = calculate_risk_score(processed_data)
+        
+        # Detect anomaly and strategy (but don't run predictions)
+        strategy, is_anomaly, explanation = detect_anomaly_and_choose_strategy(processed_data, lokasi)
+        
+        # Combine notes
+        final_note = note
+        if final_note and explanation:
+            final_note += f" | {explanation}"
+        elif explanation:
+            final_note = explanation
+        
+        return ScoreResponse(
+            lokasi=lokasi,
+            data_points_used=len(processed_data),
+            anomaly_detected=is_anomaly,
+            strategy_suggested=strategy,
+            skoring=RiskScore(
+                persentase=risk_score["persentase"],
+                kategori=risk_score["kategori"],
+                detail=RiskScoreDetail(**risk_score["detail"])
+            ),
+            note=final_note
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict_endpoint(request: ApiRequest):
     lokasi = request.lokasi.lower()
     steps = request.steps
     
-    valid_locations = ["kulkas"]
-    if lokasi not in valid_locations:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Lokasi tidak valid. Pilih: {valid_locations}"
-        )
-    
-    if steps < 1 or steps > 12:
-        raise HTTPException(
-            status_code=400,
-            detail="Steps harus antara 1-12"
-        )
-    
     try:
-        # Process input data
-        processed_data, note = process_input_data(request.data_sensor)
+        # Prepare data from Supabase
+        processed_data, note = common_prepare(lokasi, request.device_id, steps)
         
         # Calculate risk score
         risk_score = calculate_risk_score(processed_data)
@@ -674,13 +774,6 @@ async def predict(request: PredictionRequest):
         return PredictionResponse(
             lokasi=lokasi,
             data_points_used=len(processed_data),
-            strategy_used=strategy,
-            anomaly_detected=is_anomaly,
-            skoring=RiskScore(
-                persentase=risk_score["persentase"],
-                kategori=risk_score["kategori"],
-                detail=RiskScoreDetail(**risk_score["detail"])
-            ),
             note=final_note,
             prediksi=[PredictionItem(**pred) for pred in predictions]
         )
@@ -729,85 +822,60 @@ async def get_available_models():
 @app.get("/example")
 async def get_request_example():
     return {
-        "example_request": {
+        "new_request_format": {
             "lokasi": "kulkas",
-            "steps": 3,
-            "data_sensor": [
-                {
-                    "timestamp": "2025-10-22T10:00:00",
-                    "suhu": 4.2,
-                    "kelembapan": 79.5
-                },
-                {
-                    "timestamp": "2025-10-22T11:00:00",
-                    "suhu": 4.3,
-                    "kelembapan": 80.1
-                },
-                {
-                    "timestamp": "2025-10-22T12:00:00",
-                    "suhu": 4.1,
-                    "kelembapan": 80.3
-                },
-                {
-                    "timestamp": "2025-10-22T13:00:00",
-                    "suhu": 4.0,
-                    "kelembapan": 79.8
-                },
-                {
-                    "timestamp": "2025-10-22T14:00:00",
-                    "suhu": 4.2,
-                    "kelembapan": 80.0
-                }
-            ]
+            "device_id": 2,
+            "steps": 3
         },
-        "example_response": {
-            "lokasi": "kulkas",
-            "data_points_used": 5,
-            "strategy_used": "hybrid",
-            "anomaly_detected": False,
-            "skoring": {
-                "persentase": 88.5,
-                "kategori": "Aman",
-                "detail": {
-                    "skor_dasar": 92.0,
-                    "skor_trend": 85.0,
-                    "skor_stabilitas": 80.0
-                }
+        "endpoints": {
+            "/score": {
+                "description": "Risk scoring only (no predictions)",
+                "method": "POST",
+                "curl_example": 'curl -X POST "http://localhost:7860/score" -H "Content-Type: application/json" -d \'{"lokasi":"kulkas","device_id":2,"steps":3}\'',
+                "response_includes": ["lokasi", "data_points_used", "anomaly_detected", "strategy_suggested", "skoring", "note"]
             },
-            "note": "Prediksi hybrid (model + trend) - kondisi normal",
-            "prediksi": [
-                {"jam_ke": 1, "suhu": 4.3, "kelembapan": 79.8},
-                {"jam_ke": 2, "suhu": 4.5, "kelembapan": 80.2},
-                {"jam_ke": 3, "suhu": 4.6, "kelembapan": 81.0}
-            ]
+            "/predict": {
+                "description": "Full predictions with risk scoring",
+                "method": "POST",
+                "curl_example": 'curl -X POST "http://localhost:7860/predict" -H "Content-Type: application/json" -d \'{"lokasi":"kulkas","device_id":2,"steps":3}\'',
+                "response_includes": ["lokasi", "data_points_used", "prediksi", "note"]
+            }
+        },
+        "data_source": {
+            "description": "Both endpoints fetch up to last 10 data points from Supabase automatically",
+            "database": "Supabase sensor_jam table",
+            "filter": "device_id, timestamp not null",
+            "order": "timestamp desc",
+            "limit": 10,
+            "minimum_required": 3,
+            "notes": "Will work with 3-10 data points. Fewer points = less accuracy."
         },
         "notes": [
-            "Minimal 3 data point, idealnya 12+ untuk akurasi terbaik",
-            "Timestamp format ISO (YYYY-MM-DDTHH:MM:SS)",
-            "Data otomatis diurutkan berdasarkan timestamp",
-            "Sistem otomatis detect anomali dan pilih strategi",
-            "Model menggunakan scaled data dengan StandardScaler",
-            "Skoring risiko dihitung otomatis berdasarkan kondisi kulkas"
+            "Data automatically fetched from Supabase based on device_id",
+            "Requires minimum 3 data points, fetches up to 10",
+            "Works with 3-10 points, but more points = better accuracy",
+            "System automatically detects anomalies and chooses strategy",
+            "Model uses scaled data with StandardScaler",
+            "Risk scoring calculated automatically based on fridge conditions"
         ],
         "risk_scoring_info": {
             "categories": {
-                "Sangat Aman": "Skor >= 90",
-                "Aman": "Skor 75-89",
-                "Waspada": "Skor 60-74",
-                "Berisiko": "Skor 40-59",
-                "Bahaya": "Skor < 40"
+                "Sangat Aman": "Score >= 90",
+                "Aman": "Score 75-89",
+                "Waspada": "Score 60-74",
+                "Berisiko": "Score 40-59",
+                "Bahaya": "Score < 40"
             },
             "factors": {
-                "skor_dasar": "60% - Deviasi dari nilai ideal (suhu: 4°C, kelembapan: 80%)",
-                "skor_trend": "25% - Perubahan trend suhu dan kelembapan",
-                "skor_stabilitas": "15% - Volatilitas/fluktuasi data"
+                "skor_dasar": "60% - Deviation from ideal (temp: 4°C, humidity: 80%)",
+                "skor_trend": "25% - Trend changes in temperature and humidity",
+                "skor_stabilitas": "15% - Data volatility/fluctuation"
             }
         }
     }
 
 @app.get("/risk-info")
 async def get_risk_info():
-    """Endpoint untuk mendapatkan informasi tentang sistem skoring risiko"""
     return {
         "description": "Sistem skoring risiko untuk kondisi kulkas",
         "ideal_conditions": {
