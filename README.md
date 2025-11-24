@@ -169,8 +169,6 @@ If the model cannot be used or anomalies are too strong:
 
 The `/predict` endpoint returns a JSON list:
 
-![WhatsApp Image 2025-11-21 at 13 53 09_fa4b5235](https://github.com/user-attachments/assets/b4b7828d-0cfc-4e57-b998-c0820e77ea9a)
-
 ```json
 {
   "lokasi": "kulkas",
