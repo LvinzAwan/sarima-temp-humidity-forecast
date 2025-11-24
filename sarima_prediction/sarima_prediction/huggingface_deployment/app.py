@@ -9,12 +9,11 @@ import numpy as np
 from typing import Optional, List, Dict
 import warnings
 import requests
-from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 
 app = FastAPI(
     title="Prediksi Suhu & Kelembapan API",
-    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA dengan risk scoring"
+    description="API untuk prediksi suhu dan kelembapan menggunakan model SARIMA"
 )
 
 ALLOWED_ORIGINS = [
@@ -32,24 +31,20 @@ app.add_middleware(
     allow_headers=["*"],      
 )
 
-#Supabase Configuration
-SUPABASE_BASE_URL = os.environ.get(
-    "SUPABASE_BASE_URL", 
-    "https://rcvbwyvnnuurudizkuec.supabase.co/rest/v1/sensor_jam"
-)
-SUPABASE_ANON_KEY = os.environ.get(
-    "SUPABASE_ANON_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjdmJ3eXZubnV1cnVkaXprdWVjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgxOTgzNDksImV4cCI6MjA3Mzc3NDM0OX0.YCXPxFi7IQvWKN16soE0-YA_mziN9uN2B1wYkOfuhrc"
-)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://rcvbwyvnnuurudizkuec.supabase.co")
+SUPABASE_SCHEMA = os.environ.get("SUPABASE_SCHEMA", "rpl")
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "sensor_jam")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJjdmJ3eXZubnV1cnVkaXprdWVjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgxOTgzNDksImV4cCI6MjA3Mzc3NDM0OX0.YCXPxFi7IQvWKN16soE0-YA_mziN9uN2B1wYkOfuhrc")
 
-#Request/Response Models
+SUPABASE_BASE_URL = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+
 class ApiRequest(BaseModel):
-    lokasi: str = Field(..., description="Lokasi sensor: kulkas")
+    lokasi: str = Field(..., description="Lokasi sensor: ruangan atau kulkas")
     device_id: int = Field(..., description="ID device di Supabase")
-    steps: Optional[int] = Field(default=3, description="Jumlah jam prediksi (1-12)")
+    steps: Optional[int] = Field(default=60, description="Jumlah menit prediksi (1-120)")
 
 class PredictionItem(BaseModel):
-    jam_ke: int
+    menit_ke: int
     suhu: float
     kelembapan: float
 
@@ -77,93 +72,79 @@ class PredictionResponse(BaseModel):
     note: Optional[str] = None
     prediksi: List[PredictionItem]
 
-#Global Variables
 models_cache = {}
 model_stats = {}
 
-#Supabase Helper Functions
 def fetch_data_from_supabase(device_id: int) -> pd.DataFrame:
-    url = f"{SUPABASE_BASE_URL}?select=*&device_id=eq.{device_id}&timestamp=not.is.null&order=timestamp.desc&limit=10"
+    url = f"{SUPABASE_BASE_URL}?select=*&device_id=eq.{device_id}&order=timestamp.desc&limit=60"
     
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "Accept-Profile": SUPABASE_SCHEMA,
+        "Content-Profile": SUPABASE_SCHEMA
     }
-    
+
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        
         data = response.json()
-        
+
         if not data or len(data) == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Tidak ada data ditemukan untuk device_id {device_id}"
-            )
-        
+            raise HTTPException(status_code=404, detail=f"Tidak ada data untuk device_id {device_id}")
+
         df = pd.DataFrame(data)
-        
-        df = df.rename(columns={
-            'temp': 'suhu',
-            'humidity': 'kelembapan'
-        })
-        
+        df = df.rename(columns={'temp': 'suhu', 'humidity': 'kelembapan'})
+
         if 'suhu' not in df.columns or 'kelembapan' not in df.columns:
-            raise HTTPException(
-                status_code=500,
-                detail="Data dari Supabase tidak memiliki kolom temp atau humidity"
-            )
-        
+            raise HTTPException(status_code=500, detail="Kolom suhu atau kelembapan tidak ditemukan")
+
         df = df[['timestamp', 'suhu', 'kelembapan']]
         
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        if len(df) < 3:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Minimal 3 data point diperlukan, hanya {len(df)} data tersedia di device_id {device_id}"
-            )
-        
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        except:
+            pass
+
+        df = df.sort_values('timestamp', na_position='first').reset_index(drop=True)
         return df
-        
+
     except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching data from Supabase: {str(e)}"
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error parsing Supabase response: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error fetching data: {str(e)}")
+
+def prepare_data_per_minute(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    if len(df) > 60:
+        df = df.tail(60).reset_index(drop=True)
+
+    df['suhu'] = pd.to_numeric(df['suhu'], errors='coerce')
+    df['kelembapan'] = pd.to_numeric(df['kelembapan'], errors='coerce')
+    df['suhu'] = df['suhu'].interpolate()
+    df['kelembapan'] = df['kelembapan'].interpolate()
+    df = df.dropna()
+
+    return df
 
 def common_prepare(lokasi: str, device_id: int, steps: int) -> tuple[pd.DataFrame, Optional[str]]:
-    valid_locations = ["kulkas"]
+    valid_locations = ["ruangan", "kulkas"]
     if lokasi.lower() not in valid_locations:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Lokasi tidak valid. Pilih: {valid_locations}"
-        )
+        raise HTTPException(status_code=400, detail=f"Lokasi tidak valid. Pilih: {valid_locations}")
     
-    if steps < 1 or steps > 12:
-        raise HTTPException(
-            status_code=400,
-            detail="Steps harus antara 1-12"
-        )
+    if steps < 1 or steps > 120:
+        raise HTTPException(status_code=400, detail="Steps harus antara 1-120 menit")
     
     df = fetch_data_from_supabase(device_id)
+    df = prepare_data_per_minute(df)
     
     note = None
     data_count = len(df)
     
-    if data_count < 6:
-        note = f"Data hanya {data_count} point (< 6), akurasi mungkin kurang optimal. Disarankan 10+ data point."
-    elif data_count < 10:
-        note = f"Data hanya {data_count} point (< 10), untuk hasil terbaik gunakan 10+ data point."
+    if data_count < 10:
+        note = f"Data hanya {data_count} menit, akurasi mungkin kurang optimal"
+    elif data_count < 30:
+        note = f"Data hanya {data_count} menit, untuk hasil terbaik gunakan 30+ data point"
     
     df['suhu'] = pd.to_numeric(df['suhu'], errors='coerce')
     df['kelembapan'] = pd.to_numeric(df['kelembapan'], errors='coerce')
@@ -173,34 +154,28 @@ def common_prepare(lokasi: str, device_id: int, steps: int) -> tuple[pd.DataFram
         df['kelembapan'] = df['kelembapan'].interpolate(method='linear')
         
         if df['suhu'].isna().any() or df['kelembapan'].isna().any():
-            raise HTTPException(
-                status_code=400,
-                detail="Data mengandung nilai yang tidak valid"
-            )
+            raise HTTPException(status_code=400, detail="Data mengandung nilai yang tidak valid")
     
     if df['suhu'].min() < -50 or df['suhu'].max() > 100:
-        note = (note or "") + " Peringatan: Nilai suhu di luar rentang normal."
+        note = (note or "") + " Nilai suhu di luar rentang normal"
     
     if df['kelembapan'].min() < 0 or df['kelembapan'].max() > 100:
-        note = (note or "") + " Peringatan: Nilai kelembapan di luar rentang normal."
+        note = (note or "") + " Nilai kelembapan di luar rentang normal"
     
     return df, note
 
-
 def download_model_from_hf(lokasi: str):
     model_repo = "pauluswindi/prediction-sarima-models"
-    model_url = f"https://huggingface.co/{model_repo}/resolve/main/{lokasi}_models.pkl"
-    model_path = f"/tmp/{lokasi}_models.pkl"
+    model_url = f"https://huggingface.co/{model_repo}/resolve/main/{lokasi}_model.pkl"
+    model_path = f"/tmp/{lokasi}_model.pkl"
     
     try:
-        print(f"Downloading {lokasi} from {model_url}")
         response = requests.get(model_url, timeout=30)
         response.raise_for_status()
         
         with open(model_path, "wb") as f:
             f.write(response.content)
         
-        print(f"Model {lokasi} saved to {model_path}")
         return model_path
     except Exception as e:
         print(f"Error downloading model {lokasi}: {str(e)}")
@@ -208,10 +183,10 @@ def download_model_from_hf(lokasi: str):
 
 def load_models():
     global models_cache, model_stats
-    lokasi_list = ['kulkas']
+    lokasi_list = ['ruangan', 'kulkas']
     
     for lokasi in lokasi_list:
-        model_file = f"tmp/{lokasi}_models.pkl"
+        model_file = f"/tmp/{lokasi}_model.pkl"
         
         if not os.path.exists(model_file):
             model_file = download_model_from_hf(lokasi)
@@ -220,125 +195,103 @@ def load_models():
             try:
                 with open(model_file, 'rb') as f:
                     loaded_data = pickle.load(f)
-                    
-                print(f"Loaded data structure for {lokasi}: {type(loaded_data)}")
-                print(f"Keys in loaded data: {list(loaded_data.keys()) if isinstance(loaded_data, dict) else 'Not a dict'}")
                 
-                if isinstance(loaded_data, dict) and 'models' in loaded_data and 'scalers' in loaded_data:
+                if isinstance(loaded_data, dict) and 'models' in loaded_data:
                     actual_models = loaded_data['models']
-                    scalers = loaded_data['scalers']
                     
-                    print(f"Models structure for {lokasi}: {type(actual_models)}")
-                    print(f"Keys in models: {list(actual_models.keys()) if isinstance(actual_models, dict) else 'Not a dict'}")
-                    print(f"Scalers available: {list(scalers.keys()) if isinstance(scalers, dict) else 'Not a dict'}")
-                    
-                    if (isinstance(actual_models, dict) and 'suhu' in actual_models and 'kelembapan' in actual_models and
-                        isinstance(scalers, dict) and 'suhu' in scalers and 'kelembapan' in scalers):
-                        
+                    if isinstance(actual_models, dict) and 'suhu' in actual_models and 'kelembapan' in actual_models:
                         models_cache[lokasi] = {
                             'models': actual_models,
-                            'scalers': scalers,
                             'metrics': loaded_data.get('metrics', {}),
-                            'data_range': loaded_data.get('data_range', None)
+                            'frequency': loaded_data.get('frequency', 'per_minute')
                         }
-                        print(f"✓ Model {lokasi} loaded successfully with scalers")
                         model_stats[lokasi] = get_default_model_stats(lokasi)
-                    else:
-                        print(f"  Model {lokasi} missing required components")
-                        print(f"  Models keys: {list(actual_models.keys()) if isinstance(actual_models, dict) else 'None'}")
-                        print(f"  Scalers keys: {list(scalers.keys()) if isinstance(scalers, dict) else 'None'}")
-                
-                else:
-                    print(f" Model {lokasi} format not recognized. Missing 'models' or 'scalers' key")
-                    if isinstance(loaded_data, dict):
-                        print(f"Available keys: {list(loaded_data.keys())}")
-                    
+                        
             except Exception as e:
-                print(f" Error loading model {lokasi}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f" Model {lokasi} file not available")
+                print(f"Error loading model {lokasi}: {str(e)}")
 
 def get_default_model_stats(lokasi: str) -> dict:
     stats_mapping = {
         'kulkas': {
-            'suhu': {'mean': 4.0, 'std': 1.0, 'min': 1.0, 'max': 8.0},
-            'kelembapan': {'mean': 80.0, 'std': 7.0, 'min': 60.0, 'max': 95.0}
+            'suhu': {'mean': 6.0, 'std': 2.0, 'min': 0.0, 'max': 10.0},
+            'kelembapan': {'mean': 55.0, 'std': 5.0, 'min': 40.0, 'max': 70.0}
+        },
+        'ruangan': {
+            'suhu': {'mean': 25.0, 'std': 3.0, 'min': 18.0, 'max': 32.0},
+            'kelembapan': {'mean': 60.0, 'std': 10.0, 'min': 40.0, 'max': 80.0}
         }
     }
-    return stats_mapping.get(lokasi, {
-        'suhu': {'mean': 25.0, 'std': 3.0, 'min': 15.0, 'max': 35.0},
-        'kelembapan': {'mean': 60.0, 'std': 10.0, 'min': 40.0, 'max': 80.0}
-    })
+    return stats_mapping.get(lokasi, stats_mapping['ruangan'])
 
-#Risk Scoring Functions
-
-def calculate_risk_score(data: pd.DataFrame) -> dict:
-    
+def calculate_risk_score(data: pd.DataFrame, lokasi: str) -> dict:
     suhu_data = data['suhu']
     kelembapan_data = data['kelembapan']
-    
-    # Nilai terakhir
     suhu_terakhir = suhu_data.iloc[-1]
     kelembapan_terakhir = kelembapan_data.iloc[-1]
-    
-    # Skor Dasar (Deviation Score)
-    ideal_suhu = 4.0
-    ideal_kelembapan = 80.0
-    
+
+    if lokasi.lower() == 'kulkas':
+        ideal_suhu = 6.0
+        ideal_kelembapan = 55.0
+        suhu_tolerance = 4.0
+        kelembapan_tolerance = 15.0
+    else:
+        ideal_suhu = 25.0
+        ideal_kelembapan = 60.0
+        suhu_tolerance = 5.0
+        kelembapan_tolerance = 15.0
+
     deviasi_suhu = abs(suhu_terakhir - ideal_suhu)
     deviasi_kelembapan = abs(kelembapan_terakhir - ideal_kelembapan)
-    
-    skor_suhu = max(0, 100 - (deviasi_suhu / 4.0) * 100)
-    skor_kelembapan = max(0, 100 - (deviasi_kelembapan / 20.0) * 100)
-    
+
+    skor_suhu = max(0, 100 - (deviasi_suhu / suhu_tolerance) * 100)
+    skor_kelembapan = max(0, 100 - (deviasi_kelembapan / kelembapan_tolerance) * 100)
     skor_dasar = (0.6 * skor_suhu) + (0.4 * skor_kelembapan)
-    
-    #  Skor Trend (Trend-Based Scoring)
+
     trend_suhu = suhu_data.iloc[-1] - suhu_data.iloc[0]
     trend_kelembapan = kelembapan_data.iloc[-1] - kelembapan_data.iloc[0]
-    
     penalti_trend = 0
-    
-    # Penalti untuk trend suhu
-    if trend_suhu > 1.0:
-        penalti_trend += 10
-    elif trend_suhu < -1.0:
-        penalti_trend -= 5
-    
-    # Penalti untuk trend kelembapan
-    if trend_kelembapan < -10:
-        penalti_trend += 10
-    elif trend_kelembapan > 0 and kelembapan_terakhir <= 90:
-        penalti_trend -= 5
-    
+
+    if lokasi.lower() == 'kulkas':
+        if trend_suhu > 0.5:
+            penalti_trend += 10
+        elif trend_suhu < -0.5:
+            penalti_trend -= 5
+        if trend_kelembapan < -5:
+            penalti_trend += 10
+        elif trend_kelembapan > 0 and kelembapan_terakhir <= 70:
+            penalti_trend -= 5
+    else:
+        if abs(trend_suhu) > 1.0:
+            penalti_trend += 10
+        if abs(trend_kelembapan) > 5:
+            penalti_trend += 10
+
     skor_trend = max(0, min(100, 100 - penalti_trend))
-    
-    # Skor Stabilitas (Volatility Score)
+
     std_suhu = np.std(suhu_data)
     std_kelembapan = np.std(kelembapan_data)
-    
-    stabilitas_suhu = max(0, 100 - (std_suhu / 2.0) * 100)
-    stabilitas_kelembapan = max(0, 100 - (std_kelembapan / 5.0) * 100)
-    
+
+    if lokasi.lower() == 'kulkas':
+        stabilitas_suhu = max(0, 100 - (std_suhu / 1.5) * 100)
+        stabilitas_kelembapan = max(0, 100 - (std_kelembapan / 5.0) * 100)
+    else:
+        stabilitas_suhu = max(0, 100 - (std_suhu / 2.0) * 100)
+        stabilitas_kelembapan = max(0, 100 - (std_kelembapan / 5.0) * 100)
+
     skor_stabilitas = (stabilitas_suhu + stabilitas_kelembapan) / 2
-    
-    #  Skor Akhir
-    skor_akhir = (0.6 * skor_dasar) + (0.25 * skor_trend) + (0.15 * skor_stabilitas)
-    
-    # Kategori Risiko
+    skor_akhir = (0.5 * skor_dasar) + (0.3 * skor_trend) + (0.2 * skor_stabilitas)
+
     if skor_akhir >= 90:
         kategori = "Sangat Aman"
-    elif skor_akhir >= 75:
+    elif skor_akhir >= 70:
         kategori = "Aman"
-    elif skor_akhir >= 60:
+    elif skor_akhir >= 55:
         kategori = "Waspada"
-    elif skor_akhir >= 40:
+    elif skor_akhir >= 35:
         kategori = "Berisiko"
     else:
         kategori = "Bahaya"
-    
+
     return {
         "persentase": round(skor_akhir, 2),
         "kategori": kategori,
@@ -349,135 +302,74 @@ def calculate_risk_score(data: pd.DataFrame) -> dict:
         }
     }
 
-#Anomaly Detection
-
 def detect_anomaly_and_choose_strategy(data: pd.DataFrame, lokasi: str) -> tuple[str, bool, str]:
     stats = model_stats.get(lokasi, {})
     suhu_stats = stats.get('suhu', {})
     kelembapan_stats = stats.get('kelembapan', {})
-    
-    current_suhu_mean = data['suhu'].mean()
-    current_kelembapan_mean = data['kelembapan'].mean()
-    current_suhu_max = data['suhu'].max()
+
     current_suhu_min = data['suhu'].min()
-    current_kelembapan_max = data['kelembapan'].max()
+    current_suhu_max = data['suhu'].max()
     current_kelembapan_min = data['kelembapan'].min()
-    
+    current_kelembapan_max = data['kelembapan'].max()
+
     anomaly_reasons = []
-    
-    suhu_lower = suhu_stats.get('mean', 25) - (3.0 * suhu_stats.get('std', 3))
-    suhu_upper = suhu_stats.get('mean', 25) + (3.0 * suhu_stats.get('std', 3))
-    
+
+    if lokasi.lower() == 'kulkas':
+        suhu_lower, suhu_upper = 0.0, 10.0
+    else:
+        suhu_lower = suhu_stats.get('mean', 25) - 3 * suhu_stats.get('std', 3)
+        suhu_upper = suhu_stats.get('mean', 25) + 3 * suhu_stats.get('std', 3)
+
     if current_suhu_min < suhu_lower or current_suhu_max > suhu_upper:
         anomaly_reasons.append(f"Suhu di luar rentang normal ({suhu_lower:.1f}°C - {suhu_upper:.1f}°C)")
-    
-    kelembapan_lower = kelembapan_stats.get('mean', 60) - (3.0 * kelembapan_stats.get('std', 10))
-    kelembapan_upper = kelembapan_stats.get('mean', 60) + (3.0 * kelembapan_stats.get('std', 10))
-    kelembapan_lower = max(0, kelembapan_lower)
-    kelembapan_upper = min(100, kelembapan_upper)
-    
+
+    if lokasi.lower() == 'kulkas':
+        kelembapan_lower, kelembapan_upper = 40.0, 70.0
+    else:
+        kelembapan_lower = kelembapan_stats.get('mean', 60) - 3 * kelembapan_stats.get('std', 10)
+        kelembapan_upper = kelembapan_stats.get('mean', 60) + 3 * kelembapan_stats.get('std', 10)
+
     if current_kelembapan_min < kelembapan_lower or current_kelembapan_max > kelembapan_upper:
         anomaly_reasons.append(f"Kelembapan di luar rentang normal ({kelembapan_lower:.1f}% - {kelembapan_upper:.1f}%)")
-    
+
     if len(data) >= 2:
         suhu_changes = abs(data['suhu'].diff().dropna())
         kelembapan_changes = abs(data['kelembapan'].diff().dropna())
-        
-        max_suhu_change = suhu_changes.max()
-        max_kelembapan_change = kelembapan_changes.max()
-        
-        if max_suhu_change > 7.0:
-            anomaly_reasons.append(f"Perubahan suhu drastis: {max_suhu_change:.1f}°C/jam")
-        
-        if max_kelembapan_change > 15.0:
-            anomaly_reasons.append(f"Perubahan kelembapan drastis: {max_kelembapan_change:.1f}%/jam")
-    
-    if len(data) >= 3:
-        suhu_trend = calculate_trend_strength(data['suhu'].values)
-        kelembapan_trend = calculate_trend_strength(data['kelembapan'].values)
-        
-        if abs(suhu_trend) > 0.97:
-            anomaly_reasons.append(f"Trend suhu sangat kuat")
-        
-        if abs(kelembapan_trend) > 0.97:
-            anomaly_reasons.append(f"Trend kelembapan sangat kuat")
-    
+
+        if suhu_changes.max() > 0.5:
+            anomaly_reasons.append(f"Perubahan suhu drastis: {suhu_changes.max():.2f}°C/menit")
+        if kelembapan_changes.max() > 2.0:
+            anomaly_reasons.append(f"Perubahan kelembapan drastis: {kelembapan_changes.max():.2f}%/menit")
+
     is_anomaly = len(anomaly_reasons) > 0
-    
-    if is_anomaly:
-        strategy = "trend_based"
-        explanation = f"Prediksi berbasis trend: {'; '.join(anomaly_reasons)}"
-    else:
-        strategy = "hybrid"
-        explanation = "Prediksi hybrid (model + trend) - kondisi normal"
-    
+    strategy = "trend_based" if is_anomaly else "hybrid"
+    explanation = "; ".join(anomaly_reasons) if is_anomaly else "Kondisi normal"
+
     return strategy, is_anomaly, explanation
 
-def calculate_trend_strength(values: np.ndarray) -> float:
-    if len(values) < 3:
-        return 0.0
-    
-    x = np.arange(len(values))
-    correlation = np.corrcoef(x, values)[0, 1]
-    
-    return correlation if not np.isnan(correlation) else 0.0
-
-#Prediction Functions
-
-def scale_data(data, column, scaler):
-    return scaler.transform(data[[column]]).flatten()
-
-def inverse_scale_data(values, column, scaler):
-    if isinstance(values, pd.Series):
-        values = values.values
-    return scaler.inverse_transform(values.reshape(-1, 1)).flatten()
-
-def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> tuple[List[dict], str, bool, str]:
+def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 60) -> tuple[List[dict], str, bool, str]:
     strategy, is_anomaly, explanation = detect_anomaly_and_choose_strategy(data, lokasi)
     
     if lokasi not in models_cache:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model untuk lokasi '{lokasi}' tidak tersedia"
-        )
+        raise HTTPException(status_code=404, detail=f"Model untuk lokasi '{lokasi}' tidak tersedia")
     
     model_data = models_cache[lokasi]
     models = model_data['models']
-    scalers = model_data['scalers']
     
-    if not isinstance(models, dict) or not isinstance(scalers, dict):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Format model atau scaler untuk lokasi '{lokasi}' tidak valid"
-        )
+    if not isinstance(models, dict):
+        raise HTTPException(status_code=500, detail=f"Format model untuk lokasi '{lokasi}' tidak valid")
     
-    if 'suhu' not in models or 'suhu' not in scalers:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model atau scaler suhu untuk lokasi '{lokasi}' tidak ditemukan"
-        )
-    
-    if 'kelembapan' not in models or 'kelembapan' not in scalers:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model atau scaler kelembapan untuk lokasi '{lokasi}' tidak ditemukan"
-        )
-    
+    if 'suhu' not in models or 'kelembapan' not in models:
+        raise HTTPException(status_code=500, detail=f"Model tidak lengkap untuk lokasi '{lokasi}'")
+
     if strategy == "hybrid":
         try:
-            suhu_model = models['suhu']
-            kelembapan_model = models['kelembapan']
-            
-            if not hasattr(suhu_model, 'forecast'):
+            if not hasattr(models['suhu'], 'forecast') or not hasattr(models['kelembapan'], 'forecast'):
                 strategy = "trend_based"
-                explanation += " | Model suhu tidak memiliki method forecast"
-            elif not hasattr(kelembapan_model, 'forecast'):
-                strategy = "trend_based"
-                explanation += " | Model kelembapan tidak memiliki method forecast"
-                
+                explanation += " | Model tidak support forecast"
         except Exception as e:
             strategy = "trend_based"
-            explanation += f" | Error accessing models: {str(e)}"
+            explanation += f" | Error: {str(e)}"
     
     try:
         data_indexed = data.set_index('timestamp')
@@ -485,66 +377,30 @@ def predict_with_input_data(lokasi: str, data: pd.DataFrame, steps: int = 3) -> 
         kelembapan_data = data_indexed['kelembapan'].dropna()
         
         if strategy == "trend_based":
-            predictions = predict_pure_trend(suhu_data, kelembapan_data, steps)
+            predictions = predict_pure_trend(suhu_data, kelembapan_data, steps, lokasi)
         else:
             try:
-                suhu_model = models['suhu']
-                kelembapan_model = models['kelembapan']
-                suhu_scaler = scalers['suhu']
-                kelembapan_scaler = scalers['kelembapan']
-                
                 trend_weight = 0.6 if is_anomaly else 0.3
-                predictions = predict_with_trend_adaptation_scaled(
-                    suhu_data, kelembapan_data, 
-                    suhu_model, kelembapan_model,
-                    suhu_scaler, kelembapan_scaler,
-                    steps, trend_weight
-                )
-            except Exception as model_error:
-                print(f"Model prediction failed: {str(model_error)}")
-                predictions = predict_pure_trend(suhu_data, kelembapan_data, steps)
+                predictions = predict_hybrid(suhu_data, kelembapan_data, models['suhu'], models['kelembapan'], steps, trend_weight, lokasi)
+            except Exception:
+                predictions = predict_pure_trend(suhu_data, kelembapan_data, steps, lokasi)
                 strategy = "trend_based"
-                explanation = f"Fallback to trend-based due to model error: {str(model_error)}"
+                explanation = "Fallback ke trend-based"
         
         return predictions, strategy, is_anomaly, explanation
         
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error prediksi: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error prediksi: {str(e)}")
 
-def predict_with_trend_adaptation_scaled(suhu_data: pd.Series, kelembapan_data: pd.Series, 
-                                       suhu_model, kelembapan_model,
-                                       suhu_scaler, kelembapan_scaler,
-                                       steps: int, trend_weight: float = 0.3) -> List[dict]:
-    suhu_trend = calculate_advanced_trend(suhu_data.values)
-    kelembapan_trend = calculate_advanced_trend(kelembapan_data.values)
+def predict_hybrid(suhu_data: pd.Series, kelembapan_data: pd.Series, suhu_model, kelembapan_model, steps: int, trend_weight: float, lokasi: str) -> List[dict]:
+    suhu_trend = calculate_trend(suhu_data.values)
+    kelembapan_trend = calculate_trend(kelembapan_data.values)
     
     last_suhu = suhu_data.iloc[-1]
     last_kelembapan = kelembapan_data.iloc[-1]
     
-    try:
-        temp_df_suhu = pd.DataFrame({'suhu': suhu_data})
-        temp_df_kelembapan = pd.DataFrame({'kelembapan': kelembapan_data})
-        
-        suhu_scaled = scale_data(temp_df_suhu, 'suhu', suhu_scaler)
-        kelembapan_scaled = scale_data(temp_df_kelembapan, 'kelembapan', kelembapan_scaler)
-        
-        model_suhu_forecast_scaled = suhu_model.forecast(steps=steps)
-        model_kelembapan_forecast_scaled = kelembapan_model.forecast(steps=steps)
-        
-        if not isinstance(model_suhu_forecast_scaled, pd.Series):
-            model_suhu_forecast_scaled = pd.Series(model_suhu_forecast_scaled)
-        if not isinstance(model_kelembapan_forecast_scaled, pd.Series):
-            model_kelembapan_forecast_scaled = pd.Series(model_kelembapan_forecast_scaled)
-        
-        model_suhu_forecast = inverse_scale_data(model_suhu_forecast_scaled, 'suhu', suhu_scaler)
-        model_kelembapan_forecast = inverse_scale_data(model_kelembapan_forecast_scaled, 'kelembapan', kelembapan_scaler)
-        
-    except Exception as e:
-        print(f"Scaling or model forecast failed: {e}")
-        raise Exception(f"Error in scaled prediction: {str(e)}")
+    model_suhu_forecast = suhu_model.forecast(steps=steps)
+    model_kelembapan_forecast = kelembapan_model.forecast(steps=steps)
     
     predictions = []
     
@@ -555,34 +411,29 @@ def predict_with_trend_adaptation_scaled(suhu_data: pd.Series, kelembapan_data: 
         trend_suhu = last_suhu + (suhu_trend * (i + 1))
         trend_kelembapan = last_kelembapan + (kelembapan_trend * (i + 1))
         
-        try:
-            final_suhu = (trend_suhu * current_trend_weight) + (float(model_suhu_forecast[i]) * current_model_weight)
-            final_kelembapan = (trend_kelembapan * current_trend_weight) + (float(model_kelembapan_forecast[i]) * current_model_weight)
-        except Exception as e:
-            print(f"Error combining predictions at step {i}: {e}")
-            final_suhu = trend_suhu
-            final_kelembapan = trend_kelembapan
+        final_suhu = (trend_suhu * current_trend_weight) + (float(model_suhu_forecast.iloc[i]) * current_model_weight)
+        final_kelembapan = (trend_kelembapan * current_trend_weight) + (float(model_kelembapan_forecast.iloc[i]) * current_model_weight)
         
-        final_suhu = apply_constraints(final_suhu, 'suhu', last_suhu)
-        final_kelembapan = apply_constraints(final_kelembapan, 'kelembapan', last_kelembapan)
+        final_suhu = apply_constraints(final_suhu, 'suhu', last_suhu, lokasi)
+        final_kelembapan = apply_constraints(final_kelembapan, 'kelembapan', last_kelembapan, lokasi)
         
         predictions.append({
-            "jam_ke": i + 1,
+            "menit_ke": i + 1,
             "suhu": round(final_suhu, 2),
             "kelembapan": round(final_kelembapan, 2)
         })
     
     return predictions
 
-def predict_pure_trend(suhu_data: pd.Series, kelembapan_data: pd.Series, steps: int) -> List[dict]:
-    suhu_trend = calculate_advanced_trend(suhu_data.values)
-    kelembapan_trend = calculate_advanced_trend(kelembapan_data.values)
+def predict_pure_trend(suhu_data: pd.Series, kelembapan_data: pd.Series, steps: int, lokasi: str) -> List[dict]:
+    suhu_trend = calculate_trend(suhu_data.values)
+    kelembapan_trend = calculate_trend(kelembapan_data.values)
     
     last_suhu = suhu_data.iloc[-1]
     last_kelembapan = kelembapan_data.iloc[-1]
     
-    suhu_volatility = calculate_volatility(suhu_data.values)
-    kelembapan_volatility = calculate_volatility(kelembapan_data.values)
+    suhu_volatility = np.std(np.diff(suhu_data.values))
+    kelembapan_volatility = np.std(np.diff(kelembapan_data.values))
     
     predictions = []
     
@@ -592,24 +443,21 @@ def predict_pure_trend(suhu_data: pd.Series, kelembapan_data: pd.Series, steps: 
         pred_suhu = last_suhu + (suhu_trend * (i + 1) * damping_factor)
         pred_kelembapan = last_kelembapan + (kelembapan_trend * (i + 1) * damping_factor)
         
-        suhu_noise = np.random.normal(0, suhu_volatility * 0.1)
-        kelembapan_noise = np.random.normal(0, kelembapan_volatility * 0.1)
+        pred_suhu += np.random.normal(0, suhu_volatility * 0.1)
+        pred_kelembapan += np.random.normal(0, kelembapan_volatility * 0.1)
         
-        pred_suhu += suhu_noise
-        pred_kelembapan += kelembapan_noise
-        
-        pred_suhu = apply_pure_constraints(pred_suhu, 'suhu', last_suhu, i + 1)
-        pred_kelembapan = apply_pure_constraints(pred_kelembapan, 'kelembapan', last_kelembapan, i + 1)
+        pred_suhu = apply_constraints(pred_suhu, 'suhu', last_suhu, lokasi, i + 1)
+        pred_kelembapan = apply_constraints(pred_kelembapan, 'kelembapan', last_kelembapan, lokasi, i + 1)
         
         predictions.append({
-            "jam_ke": i + 1,
+            "menit_ke": i + 1,
             "suhu": round(pred_suhu, 2),
             "kelembapan": round(pred_kelembapan, 2)
         })
     
     return predictions
 
-def calculate_advanced_trend(values: np.ndarray) -> float:
+def calculate_trend(values: np.ndarray) -> float:
     if len(values) < 2:
         return 0.0
     
@@ -626,79 +474,41 @@ def calculate_advanced_trend(values: np.ndarray) -> float:
     
     return float(slope)
 
-def calculate_volatility(values: np.ndarray) -> float:
-    if len(values) < 2:
-        return 0.1
-    
-    diffs = np.diff(values)
-    volatility = np.std(diffs)
-    
-    return max(volatility, 0.05)
+def apply_constraints(value: float, param_type: str, last_value: float, lokasi: str, step: int = 1) -> float:
+    max_change_per_minute = {'suhu': 0.15, 'kelembapan': 0.5}
+    max_change = max_change_per_minute.get(param_type, 0.1) * step
 
-def apply_pure_constraints(value: float, param_type: str, last_value: float, step: int) -> float:
-    max_hourly_change = {
-        'suhu': 1.5,
-        'kelembapan': 3.0
-    }
-    
-    max_change_per_step = max_hourly_change.get(param_type, 1.0) * step
-    
-    if abs(value - last_value) > max_change_per_step:
-        if value > last_value:
-            value = last_value + max_change_per_step
-        else:
-            value = last_value - max_change_per_step
-    
-    if param_type == 'suhu':
-        value = np.clip(value, -30, 60)
-    elif param_type == 'kelembapan':
-        value = np.clip(value, 0, 100)
-    
-    return value
-
-def apply_constraints(value: float, param_type: str, last_value: float) -> float:
-    max_hourly_change = {
-        'suhu': 2.0,
-        'kelembapan': 5.0
-    }
-    
-    max_change = max_hourly_change.get(param_type, 1.0)
-    
     if abs(value - last_value) > max_change:
-        if value > last_value:
-            value = last_value + max_change
-        else:
-            value = last_value - max_change
-    
-    if param_type == 'suhu':
-        value = np.clip(value, -30, 60)
-    elif param_type == 'kelembapan':
-        value = np.clip(value, 0, 100)
-    
-    return value
+        value = last_value + max_change if value > last_value else last_value - max_change
 
-#API Endpoints
+    if param_type == 'suhu':
+        if lokasi == "kulkas":
+            value = np.clip(value, 0, 10)
+        else:
+            value = np.clip(value, -30, 60)
+    elif param_type == 'kelembapan':
+        if lokasi == "kulkas":
+            value = np.clip(value, 40, 70)
+        else:
+            value = np.clip(value, 0, 100)
+
+    return value
 
 @app.on_event("startup")
 async def startup_event():
-    print("Loading SARIMA models...")
     load_models()
-    print("Aplikasi siap!")
 
 @app.get("/")
 async def root():
     return {
-        "message": "Prediksi Suhu & Kelembapan API with Risk Scoring",
-        "description": "API untuk prediksi dengan data dari Supabase dan skoring risiko",
+        "message": "Prediksi Suhu & Kelembapan API",
         "status": "running",
-        "available_locations": ["kulkas"],
+        "available_locations": ["ruangan", "kulkas"],
         "models_loaded": list(models_cache.keys()),
-        "features": ["prediction", "risk_scoring", "anomaly_detection", "supabase_integration"],
         "endpoints": {
-            "/score": "Risk scoring only (no predictions)",
+            "/score": "Risk scoring only",
             "/predict": "Full predictions with risk scoring"
-        },
-        "docs": "/docs"
+        }
     }
 
 @app.get("/health")
@@ -706,8 +516,7 @@ async def health_check():
     return {
         "status": "healthy",
         "models_loaded": len(models_cache),
-        "available_models": list(models_cache.keys()),
-        "supabase_configured": bool(SUPABASE_ANON_KEY and SUPABASE_BASE_URL)
+        "available_models": list(models_cache.keys())
     }
 
 @app.post("/score", response_model=ScoreResponse)
@@ -715,16 +524,10 @@ async def score_endpoint(request: ApiRequest):
     lokasi = request.lokasi.lower()
     
     try:
-        # Prepare data from Supabase
         processed_data, note = common_prepare(lokasi, request.device_id, request.steps)
-        
-        # Calculate risk score
-        risk_score = calculate_risk_score(processed_data)
-        
-        # Detect anomaly and strategy (but don't run predictions)
+        risk_score = calculate_risk_score(processed_data, lokasi)
         strategy, is_anomaly, explanation = detect_anomaly_and_choose_strategy(processed_data, lokasi)
         
-        # Combine notes
         final_note = note
         if final_note and explanation:
             final_note += f" | {explanation}"
@@ -743,7 +546,6 @@ async def score_endpoint(request: ApiRequest):
             ),
             note=final_note
         )
-    
     except HTTPException:
         raise
     except Exception as e:
@@ -755,16 +557,9 @@ async def predict_endpoint(request: ApiRequest):
     steps = request.steps
     
     try:
-        # Prepare data from Supabase
         processed_data, note = common_prepare(lokasi, request.device_id, steps)
-        
-        # Calculate risk score
-        risk_score = calculate_risk_score(processed_data)
-        
-        # Make predictions
         predictions, strategy, is_anomaly, explanation = predict_with_input_data(lokasi, processed_data, steps)
         
-        # Combine notes
         final_note = note
         if final_note and explanation:
             final_note += f" | {explanation}"
@@ -777,7 +572,6 @@ async def predict_endpoint(request: ApiRequest):
             note=final_note,
             prediksi=[PredictionItem(**pred) for pred in predictions]
         )
-    
     except HTTPException:
         raise
     except Exception as e:
@@ -789,144 +583,19 @@ async def get_available_models():
     
     for lokasi, model_data in models_cache.items():
         models = model_data.get('models', {})
-        scalers = model_data.get('scalers', {})
         metrics = model_data.get('metrics', {})
+        frequency = model_data.get('frequency', 'unknown')
         
         model_info[lokasi] = {
             "suhu_model_available": "suhu" in models,
             "kelembapan_model_available": "kelembapan" in models,
-            "suhu_scaler_available": "suhu" in scalers,
-            "kelembapan_scaler_available": "kelembapan" in scalers
+            "frequency": frequency
         }
-        
-        if "suhu" in models:
-            try:
-                model_info[lokasi]["suhu_aic"] = round(models["suhu"].aic, 2)
-            except:
-                pass
-        
-        if "kelembapan" in models:
-            try:
-                model_info[lokasi]["kelembapan_aic"] = round(models["kelembapan"].aic, 2)
-            except:
-                pass
         
         if metrics:
             model_info[lokasi]["metrics"] = metrics
     
-    return {
-        "loaded_models": model_info,
-        "total_locations": len(model_info)
-    }
-
-@app.get("/example")
-async def get_request_example():
-    return {
-        "new_request_format": {
-            "lokasi": "kulkas",
-            "device_id": 2,
-            "steps": 3
-        },
-        "endpoints": {
-            "/score": {
-                "description": "Risk scoring only (no predictions)",
-                "method": "POST",
-                "curl_example": 'curl -X POST "http://localhost:7860/score" -H "Content-Type: application/json" -d \'{"lokasi":"kulkas","device_id":2,"steps":3}\'',
-                "response_includes": ["lokasi", "data_points_used", "anomaly_detected", "strategy_suggested", "skoring", "note"]
-            },
-            "/predict": {
-                "description": "Full predictions with risk scoring",
-                "method": "POST",
-                "curl_example": 'curl -X POST "http://localhost:7860/predict" -H "Content-Type: application/json" -d \'{"lokasi":"kulkas","device_id":2,"steps":3}\'',
-                "response_includes": ["lokasi", "data_points_used", "prediksi", "note"]
-            }
-        },
-        "data_source": {
-            "description": "Both endpoints fetch up to last 10 data points from Supabase automatically",
-            "database": "Supabase sensor_jam table",
-            "filter": "device_id, timestamp not null",
-            "order": "timestamp desc",
-            "limit": 10,
-            "minimum_required": 3,
-            "notes": "Will work with 3-10 data points. Fewer points = less accuracy."
-        },
-        "notes": [
-            "Data automatically fetched from Supabase based on device_id",
-            "Requires minimum 3 data points, fetches up to 10",
-            "Works with 3-10 points, but more points = better accuracy",
-            "System automatically detects anomalies and chooses strategy",
-            "Model uses scaled data with StandardScaler",
-            "Risk scoring calculated automatically based on fridge conditions"
-        ],
-        "risk_scoring_info": {
-            "categories": {
-                "Sangat Aman": "Score >= 90",
-                "Aman": "Score 75-89",
-                "Waspada": "Score 60-74",
-                "Berisiko": "Score 40-59",
-                "Bahaya": "Score < 40"
-            },
-            "factors": {
-                "skor_dasar": "60% - Deviation from ideal (temp: 4°C, humidity: 80%)",
-                "skor_trend": "25% - Trend changes in temperature and humidity",
-                "skor_stabilitas": "15% - Data volatility/fluctuation"
-            }
-        }
-    }
-
-@app.get("/risk-info")
-async def get_risk_info():
-    return {
-        "description": "Sistem skoring risiko untuk kondisi kulkas",
-        "ideal_conditions": {
-            "suhu": "4°C",
-            "kelembapan": "80%"
-        },
-        "scoring_components": {
-            "skor_dasar": {
-                "weight": "60%",
-                "description": "Mengukur deviasi dari nilai ideal",
-                "calculation": "Berdasarkan jarak nilai terakhir dari kondisi ideal"
-            },
-            "skor_trend": {
-                "weight": "25%",
-                "description": "Mengukur perubahan trend",
-                "penalties": {
-                    "suhu_naik": "Penalti 10 jika suhu naik > 1°C",
-                    "suhu_turun": "Bonus 5 jika suhu turun > 1°C",
-                    "kelembapan_turun": "Penalti 10 jika kelembapan turun > 10%",
-                    "kelembapan_naik_normal": "Bonus 5 jika kelembapan naik dan <= 90%"
-                }
-            },
-            "skor_stabilitas": {
-                "weight": "15%",
-                "description": "Mengukur volatilitas/fluktuasi data",
-                "calculation": "Berdasarkan standar deviasi suhu dan kelembapan"
-            }
-        },
-        "categories": {
-            "Sangat Aman": {
-                "range": "90-100",
-                "description": "Kondisi optimal, tidak ada risiko"
-            },
-            "Aman": {
-                "range": "75-89",
-                "description": "Kondisi baik, risiko minimal"
-            },
-            "Waspada": {
-                "range": "60-74",
-                "description": "Perlu perhatian, ada deviasi kecil"
-            },
-            "Berisiko": {
-                "range": "40-59",
-                "description": "Memerlukan tindakan segera"
-            },
-            "Bahaya": {
-                "range": "0-39",
-                "description": "Kondisi kritis, tindakan mendesak diperlukan"
-            }
-        }
-    }
+    return {"loaded_models": model_info, "total_locations": len(model_info)}
 
 if __name__ == "__main__":
     import uvicorn
